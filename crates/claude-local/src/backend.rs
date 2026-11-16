@@ -1999,6 +1999,44 @@ fn local_launch_args(_root: &Path, port: u16, localization: bool) -> Vec<String>
 }
 
 
+/// 把上游写进 Claude Code 的 `settings.json` 的 `env`。
+///
+/// Linux 上 Claude 会剥离继承来的 `ANTHROPIC_*`（网络覆盖保护），只靠命令行
+/// 环境变量传不进去；内置 Claude Code 于是回落到 `https://api.anthropic.com`，
+/// 经本地代理时报 `SSL certificate verification failed`。
+/// 配置文件才是它真正读取的来源，所以写这里。
+///
+/// 只动 `env` 下这几个键，其余（`modelSettings`、用户自加的）原样保留。
+fn write_code_upstream_env(code_dir: &Path, port: u16, token: &str) -> Result<()> {
+    fs::create_dir_all(code_dir)?;
+    let path = code_dir.join("settings.json");
+    let mut settings: Value = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let Some(object) = settings.as_object_mut() else {
+        return Ok(());
+    };
+    let env = object.entry("env").or_insert_with(|| json!({}));
+    if !env.is_object() {
+        *env = json!({});
+    }
+    if let Some(env) = env.as_object_mut() {
+        env.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            json!(format!("http://127.0.0.1:{port}")),
+        );
+        env.insert("ANTHROPIC_AUTH_TOKEN".into(), json!(token));
+        env.insert("ANTHROPIC_API_KEY".into(), json!(token));
+        // 本地服务是明文 HTTP，别让它绕去任何继承来的代理。
+        env.insert("NO_PROXY".into(), json!("localhost,127.0.0.1"));
+        env.insert("no_proxy".into(), json!("localhost,127.0.0.1"));
+    }
+    crate::fsutil::atomic_write(&path, &serde_json::to_vec_pretty(&settings)?)?;
+    Ok(())
+}
+
 /// 把每个模型的压缩窗口写进 Claude Code 的 `settings.json`。
 ///
 /// Claude Code 支持**逐模型**的压缩设置：`modelSettings.<canonical model>.autoCompactWindow`
@@ -2194,6 +2232,23 @@ fn launch_original(
         // 完整功能模式直接用真实 Claude profile（无 --user-data-dir），启动前切到 1p 并记录回滚信息。
         apply_real_profile_one_p(&profile_sets(), root)?;
         apply_code_dir(&mut command, root, share_home, &home_dir().join(".claude"))?;
+
+        // Linux：Claude 有网络覆盖保护，会剥离继承来的 ANTHROPIC_* 环境变量，
+        // 内置 Claude Code 因此回落到 `https://api.anthropic.com`——经本地代理时
+        // 就是「SSL certificate verification failed」。配置文件才是它真正读取的
+        // 来源，所以把上游写进 `<code_dir>/settings.json` 的 `env`。
+        //
+        // 共用 `~/.claude` 时不动，那是用户自己的配置（cc-switch 等会维护它）。
+        #[cfg(target_os = "linux")]
+        if !share_home
+            && let Err(error) =
+                write_code_upstream_env(&full_code_dir(root), port, &upstream.token)
+        {
+            let _ = crate::host::diagnostic(
+                "claude_local.write_code_env_failed",
+                serde_json::json!({ "error": format!("{error:#}") }),
+            );
+        }
         command
             .args(local_launch_args(root, port, localization))
             .env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"))

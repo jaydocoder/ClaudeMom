@@ -10,6 +10,10 @@
 - Linux：真实 profile 目录改用 XDG 的 `~/.config/Claude`（和 `~/.config/Claude-3p`），不再是 `~/Library/Application Support`。
 - Linux：进程识别、停止、遗留代理回收改用 `pgrep` 与 `/bin/kill`。
 - 打包：新增 `deb` 目标；`createUpdaterArtifacts` 关闭（fork 没有自己的签名密钥，开着只会让构建报错）。
+- Linux：真正让内置 Claude Code 可用的是**配置文件**而不是环境变量。Claude 有网络覆盖保护，会剥离继承来的
+  `ANTHROPIC_*`，Claude Code 于是回落到 `https://api.anthropic.com`，经本地代理就是 SSL 报错。
+  启动前把上游写进 Claude Code 的 `<code_dir>/settings.json` 的 `env`（`ANTHROPIC_BASE_URL` 指向本地
+  明文端口），它就不再走 TLS，证书问题随之消失。共用 `~/.claude` 时不写，避免改动用户自己的配置。
 - 新增诊断：`cargo run --example probe_linux -p claude-local` 打印解析到的安装路径与版本。
 
 ## 0.1.3 - 2026-11-15
