@@ -2179,12 +2179,21 @@ const MITM_HOSTS = runtime.managed
   ? /(^|\.)(claude\.ai|claude\.com|anthropic\.com)$/i
   : /(^|\.)(claude\.ai|claude\.com|anthropic\.com|ccbobi\.com)$/i;
 
+// Linux 专属：Electron 的 Node 侧（内置 Claude Code）用自带的根证书，既不读 NSS
+// 也不读系统 store，而 Claude 有网络覆盖保护、会剥离 NODE_EXTRA_CA_CERTS 这类注入。
+// 它打 api.anthropic.com 时会被本地 MITM 证书拒掉，界面上显示为
+// 「Claude Code couldn't trace this connection's certificate to an authority that it trusts」。
+// 这些请求本该走 ANTHROPIC_BASE_URL 的本地明文端口，直通掉就不会撞证书校验；
+// 代价是官方 OAuth 换票与托管设置不再本地 mock（对话本身不经这条路）。
+const DIRECT_ANTHROPIC = process.env.CLAUDE_LOCAL_DIRECT_ANTHROPIC === "1";
+const shouldMitm = (host) =>
+  !(DIRECT_ANTHROPIC && /^api\.anthropic\.com$/i.test(host)) && MITM_HOSTS.test(host);
 outer.on("connect", (req, clientSocket, head) => {
   noteClient();
   clientSocket.on("error", () => {});
   const [host, port = "443"] = req.url.split(":");
   // 非 claude 域名：TCP 直通，不终止 TLS（保证 CDN / 其他服务不受影响）
-  if (!MITM_HOSTS.test(host)) {
+  if (!shouldMitm(host)) {
     log(`PASS-THROUGH CONNECT ${host}:${port}`);
     const upstream = net.connect(Number(port), host, () => {
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
