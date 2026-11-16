@@ -162,7 +162,34 @@ pub fn is_claude_msix_path(path: &Path) -> bool {
             || (tail.len() == 2 && tail[1].eq_ignore_ascii_case("claude-desktop.exe")))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+/// Linux：官方 Claude Desktop 由 APT 包安装到 `/usr/lib/claude-desktop`，
+/// 可执行文件与 `resources/` 和 macOS 一样同目录并列（不是 `.app` 包结构）。
+///
+/// 逐项探测而不是硬编码单一路径，是因为社区重打包版（`claude-desktop-unofficial`）
+/// 与手工 `AppImage` 解包可能落在其它前缀；都找不到时回退官方路径，
+/// 让上层的「未安装」判断给出正常提示。
+#[cfg(target_os = "linux")]
+pub fn source_app(_deadline: Instant) -> Result<PathBuf> {
+    const CANDIDATES: [&str; 3] = [
+        "/usr/lib/claude-desktop",
+        "/usr/lib/claude-desktop-unofficial",
+        "/opt/claude-desktop",
+    ];
+    for candidate in CANDIDATES {
+        let path = PathBuf::from(candidate);
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+    // 用户级安装：手工解包的 AppImage / 便携版常放这里，也算装上。
+    let user = home_dir().join(".local/lib/claude-desktop");
+    if user.is_dir() {
+        return Ok(user);
+    }
+    Ok(PathBuf::from(CANDIDATES[0]))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn source_app(_deadline: Instant) -> Result<PathBuf> {
     Ok(PathBuf::from("Claude.exe"))
 }
@@ -192,7 +219,20 @@ pub fn app_version(app: &Path, _key: &str, deadline: Instant) -> Result<String> 
     Ok(if output.status.success() { String::from_utf8_lossy(&output.stdout).trim().to_string() } else { String::new() })
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+/// Linux：安装目录里的 `version` 文件是唯一可靠的版本来源
+/// （Electron 的 `app.asar` 里虽有 package.json，但读它要解包，没必要）。
+#[cfg(target_os = "linux")]
+pub fn app_version(app: &Path, _key: &str, _deadline: Instant) -> Result<String> {
+    let file = app.join("version");
+    if !file.is_file() {
+        return Ok(String::new());
+    }
+    Ok(fs::read_to_string(&file)
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn app_version(_app: &Path, _key: &str, _deadline: Instant) -> Result<String> { Ok(String::new()) }
 
 #[cfg(test)]

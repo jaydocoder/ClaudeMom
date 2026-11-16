@@ -1,5 +1,14 @@
 # 更新日志
 
+## 未发布 · Linux 支持（jaydocoder fork）
+
+- Linux：支持 Anthropic 官方 Claude Desktop 的 deb 安装（`/usr/lib/claude-desktop`，2026-06-30 起官方发布）。安装目录、可执行文件、`resources/`、版本号都按 Linux 布局解析，另带社区重打包版与 `~/.local/lib/claude-desktop` 的探测回退。
+- Linux：本地 CA 必须写进 Electron/Chromium 自己的 NSS 证书库（`~/.pki/nssdb`，经 `certutil`）。系统 openssl store 对它无效——只装系统 CA 的现象是 `curl` 正常、Claude 报 `-202 ERR_CERT_AUTHORITY_INVALID`。本项替代 macOS 的 `security add-trusted-cert`。依赖 `libnss3-tools`。
+- Linux：真实 profile 目录改用 XDG 的 `~/.config/Claude`（和 `~/.config/Claude-3p`），不再是 `~/Library/Application Support`。
+- Linux：进程识别、停止、遗留代理回收改用 `pgrep` 与 `/bin/kill`。
+- 打包：新增 `deb` 目标；`createUpdaterArtifacts` 关闭（fork 没有自己的签名密钥，开着只会让构建报错）。
+- 新增诊断：`cargo run --example probe_linux -p claude-local` 打印解析到的安装路径与版本。
+
 ## 0.1.3 - 2026-11-15
 
 - Windows：新版 Claude 桌面版主页没有「对话 | Cowork」切换的问题修好了，Cowork 默认打开；不想要可以在 设置 → 高级 → Cowork 关掉。

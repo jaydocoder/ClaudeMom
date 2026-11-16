@@ -12,6 +12,8 @@ pub fn locate_node() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    // 只有 macOS 分支会 push，其它平台用不到 `mut`。
+    #[allow(unused_mut)]
     let mut candidates: Vec<PathBuf> = Vec::new();
     #[cfg(target_os = "macos")]
     {

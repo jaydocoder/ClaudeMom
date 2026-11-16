@@ -174,9 +174,16 @@ fn home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
-/// 原版 Claude 本地模式支持的平台：macOS 与 Windows。
+/// 原版 Claude 本地模式支持的平台：macOS、Windows 与 Linux。
+///
+/// Linux 自 2026-06-30 起有 Anthropic 官方 APT 包（Electron 打包，结构与 macOS 同构），
+/// 所以本地兼容服务这条链路在三个平台上成立。
 fn platform_supported() -> bool {
-    cfg!(any(target_os = "macos", target_os = "windows"))
+    cfg!(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "linux"
+    ))
 }
 
 /// Windows 上解析 Claude.exe 要走 PowerShell 查 Appx 包，冷启动很慢（status 每 3 秒
@@ -203,7 +210,7 @@ fn source_app() -> PathBuf {
     resolved
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 fn source_app() -> PathBuf {
     let system = PathBuf::from("/Applications/Claude.app");
     if system.is_dir() {
@@ -213,21 +220,44 @@ fn source_app() -> PathBuf {
     }
 }
 
+/// Linux：安装前缀固定（`/usr/lib/claude-desktop`），没有 macOS 那种用户级回退，
+/// 所以每次都直接探测目录，不做缓存——目录探测的开销比缓存失效逻辑更省心。
+#[cfg(target_os = "linux")]
+fn source_app() -> PathBuf {
+    crate::desktop::source_app(Instant::now() + Duration::from_secs(2))
+        .unwrap_or_else(|_| PathBuf::from("/usr/lib/claude-desktop"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn source_app() -> PathBuf {
+    PathBuf::from("Claude.exe")
+}
+
+/// 可执行文件位置：
+/// - Windows：`source` 本身就是 `Claude.exe`
+/// - macOS：`Claude.app/Contents/MacOS/Claude`
+/// - Linux：`source` 是安装目录，`claude-desktop` 与 `resources/` 同级并列
 fn executable(source: &Path) -> PathBuf {
     if cfg!(windows) {
         source.to_path_buf()
+    } else if cfg!(target_os = "linux") {
+        source.join("claude-desktop")
     } else {
         source.join("Contents/MacOS/Claude")
     }
 }
 
-/// 官方应用自带的页面资源目录：mac 在 bundle 里，Windows 在 exe 旁边的 `resources/`。
+/// 官方应用自带的页面资源目录：mac 在 bundle 的 `Contents/Resources`，
+/// Windows 在 exe 旁边的 `resources/`，Linux 在安装目录下的 `resources/`
+/// （与 macOS 同构，但少一层 `Contents/`）。
 fn desktop_resources(source: &Path) -> PathBuf {
     if cfg!(windows) {
         source
             .parent()
             .map(|dir| dir.join("resources"))
             .unwrap_or_default()
+    } else if cfg!(target_os = "linux") {
+        source.join("resources")
     } else {
         source.join("Contents/Resources")
     }
@@ -241,9 +271,14 @@ fn source_supported(source: &Path) -> bool {
         return executable(source).is_file()
             || crate::desktop::is_claude_msix_path(source);
     }
-    #[cfg(not(windows))]
+    // Linux 的 deb 把可执行文件装成真实文件，`is_file` 就够；没有 MSIX 那种虚拟化路径。
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        cfg!(target_os = "macos") && executable(source).is_file()
+        executable(source).is_file()
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        false
     }
 }
 
@@ -407,31 +442,63 @@ struct ProfileSet {
     three_p: PathBuf,
 }
 
-fn profile_sets() -> Vec<ProfileSet> {
-    #[cfg(target_os = "windows")]
-    {
-        let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
-        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-        return profile_sets_for(true, &home_dir(), roaming.as_deref(), local.as_deref());
-    }
-    #[cfg(not(target_os = "windows"))]
-    profile_sets_for(false, &home_dir(), None, None)
+/// `profile_sets_for` 的平台维度。显式传参而不是内部读 `cfg!`，是为了让这个纯函数
+/// 能在任意主机上测三种布局（Linux 开发机上照样要覆盖 macOS / Windows 的目录形状）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfilePlatform {
+    Mac,
+    Windows,
+    Linux,
 }
 
-/// 纯计算部分：目录由调用方注入，可在 mac 上测 Windows 布局。
+impl ProfilePlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            Self::Mac
+        }
+    }
+}
+
+fn profile_sets() -> Vec<ProfileSet> {
+    match ProfilePlatform::current() {
+        ProfilePlatform::Windows => {
+            let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
+            let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+            profile_sets_for(
+                ProfilePlatform::Windows,
+                &home_dir(),
+                roaming.as_deref(),
+                local.as_deref(),
+            )
+        }
+        platform => profile_sets_for(platform, &home_dir(), None, None),
+    }
+}
+
+/// 纯计算部分：目录由调用方注入，可在任一平台上测其它平台的布局。
+///
+/// macOS 是 `~/Library/Application Support`；Linux 的 Electron 走 XDG，用户数据在
+/// `~/.config`（官方 deb 的 Claude Desktop 用的就是这个目录）。
 ///
 /// Windows 下第一组是 classic 安装（data 在 `%APPDATA%`，mode/3p 在 `%LOCALAPPDATA%`）；
 /// 之后 `%LOCALAPPDATA%\Packages` 里每个 `Claude_*` / `AnthropicPBC.Claude_*` 包
 /// （大小写不敏感、排序后）各一组 MSIX 虚拟化目录。APPDATA/LOCALAPPDATA 缺失时
 /// 回退 `home\AppData\Roaming|Local`。返回的第一组是主集合。
 fn profile_sets_for(
-    windows: bool,
+    platform: ProfilePlatform,
     home: &Path,
     roaming: Option<&Path>,
     local: Option<&Path>,
 ) -> Vec<ProfileSet> {
-    if !windows {
-        let support = home.join("Library/Application Support");
+    if platform != ProfilePlatform::Windows {
+        let support = match platform {
+            ProfilePlatform::Linux => home.join(".config"),
+            _ => home.join("Library/Application Support"),
+        };
         return vec![ProfileSet {
             data: support.join("Claude"),
             mode: support.join("Claude"),
@@ -821,7 +888,7 @@ fn quit_claude_with_proxy(port: u16) -> Result<bool> {
     if pids.is_empty() {
         return Ok(false);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         for pid in &pids {
             let _ = Command::new("/bin/kill")
@@ -841,7 +908,7 @@ fn quit_claude_with_proxy(port: u16) -> Result<bool> {
     while Instant::now() < deadline && pids.iter().any(|pid| process_alive(*pid)) {
         std::thread::sleep(Duration::from_millis(50));
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     for pid in pids.iter().filter(|pid| process_alive(**pid)) {
         let _ = Command::new("/bin/kill")
             .args(["-KILL", &pid.to_string()])
@@ -919,7 +986,23 @@ fn claude_processes() -> Result<String> {
         }
         return Ok(listing);
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    // Linux：Electron 的主进程与子进程命令行都以可执行文件路径开头，
+    // 用 `claude-desktop( |$)` 一并匹配；`-fl` 的输出与 macOS 的 pgrep 同形状
+    // （`{pid} {command_line}`），上游的 `claude_pids_on_proxy` 原样可用。
+    // 同一模式也覆盖社区重打包的 `claude-desktop-unofficial`。
+    #[cfg(target_os = "linux")]
+    {
+        let (success, bytes) = probe(
+            Command::new("pgrep").args(["-fl", "claude-desktop( |$)"]),
+            PROBE_TIMEOUT,
+        )?;
+        return Ok(if success {
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            String::new()
+        });
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     Ok(String::new())
 }
 
@@ -966,7 +1049,14 @@ fn version(source: &Path) -> String {
     resolved
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+/// Linux：安装目录里的 `version` 文件是唯一可靠的版本来源。
+#[cfg(target_os = "linux")]
+fn version(source: &Path) -> String {
+    crate::desktop::app_version(source, "", Instant::now() + Duration::from_secs(2))
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn version(_source: &Path) -> String {
     String::new()
 }
@@ -1026,8 +1116,54 @@ fn ca_trusted(root: &Path) -> bool {
         )
         .is_ok_and(|(success, _)| success);
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    // Linux：Electron/Chromium 用自己的 NSS 证书库（`~/.pki/nssdb`），不读系统
+    // openssl store——只装系统 CA 时 curl 能过、Claude 却报 -202 ERR_CERT_AUTHORITY_INVALID。
+    //
+    // 注意 `certutil -L -n <别名>` 打印的是证书详情（不含别名与 trust flags），
+    // 所以这里必须用不带 `-n` 的 `-L`：每个条目一行 `<别名> <trust flags>`，
+    // 只认别名之后出现 `C`（SSL CA 信任）的那些。
+    #[cfg(target_os = "linux")]
+    {
+        let Some(db) = nss_db() else {
+            return false;
+        };
+        let name = host().ca_name();
+        return probe(
+            hidden_command("certutil").arg("-d").arg(&db).arg("-L"),
+            Duration::from_secs(10),
+        )
+        .is_ok_and(|(success, bytes)| {
+            success && nss_listing_trusts(&String::from_utf8_lossy(&bytes), name)
+        });
+    }
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     false
+}
+
+/// 在 `certutil -L` 的输出里判断某个别名是否带 SSL CA 信任标记。
+///
+/// 每行形如 `Claude Local CA                        C,,`，trust flags 在别名右侧。
+/// 别名本身可能含 `C`（如 `Claude ... CA`），所以只检查别名之后的部分。
+///
+/// 单独抽出来是因为这里是纯字符串解析：`certutil -L -n <别名>` 打印的是证书详情，
+/// 不含别名与 flags，用错参数会静默判成「未信任」，需要能直接单测。
+#[cfg(any(target_os = "linux", test))]
+fn nss_listing_trusts(listing: &str, name: &str) -> bool {
+    listing.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.contains('C'))
+    })
+}
+
+/// Linux 的 NSS 证书库位置，返回 `certutil -d` 要的 `sql:` 形式。
+///
+/// Chromium / Electron 首次运行会自己建库，所以这里只读不建：
+/// 库不存在说明客户端还没跑过，信任也就无从谈起。
+#[cfg(target_os = "linux")]
+fn nss_db() -> Option<String> {
+    let dir = home_dir().join(".pki/nssdb");
+    dir.is_dir().then(|| format!("sql:{}", dir.display()))
 }
 
 fn prepare_ca(root: &Path) -> Result<()> {
@@ -1114,7 +1250,7 @@ fn generate_ca(ca: &Path, ca_name: &str) -> Result<()> {
 fn trust_ca(root: &Path) -> Result<()> {
     ensure!(
         platform_supported(),
-        "本地证书信任目前仅支持 macOS 和 Windows"
+        "本地证书信任目前仅支持 macOS、Windows 和 Linux"
     );
     if ca_trusted(root) {
         return Ok(());
@@ -1137,6 +1273,32 @@ fn trust_ca(root: &Path) -> Result<()> {
         Duration::from_secs(120),
         "本地证书尚未信任，请在 Windows 弹出的安全警告中点击“是”后重试",
     )?;
+    // Linux：必须写进 Electron/Chromium 自己的 NSS 库，系统 openssl store 对它无效
+    // （只装系统 CA 的表现是 curl 正常、Claude 报 -202）。
+    // 先按别名删旧条目：重新生成证书后同名会让 `-A` 报 SEC_ERROR_ADDING_CERT。
+    #[cfg(target_os = "linux")]
+    {
+        let Some(db) = nss_db() else {
+            bail!("找不到 NSS 证书库 ~/.pki/nssdb，请先启动一次 Claude Desktop 再重试");
+        };
+        let name = host().ca_name();
+        let _ = probe(
+            hidden_command("certutil")
+                .arg("-d")
+                .arg(&db)
+                .args(["-D", "-n", name]),
+            Duration::from_secs(30),
+        );
+        checked(
+            hidden_command("certutil")
+                .arg("-d")
+                .arg(&db)
+                .args(["-A", "-t", "C,,", "-n", name])
+                .arg(root.join("ca/ca.pem")),
+            Duration::from_secs(30),
+            "本地证书未能写入 NSS 证书库，请确认已安装 libnss3-tools（提供 certutil）",
+        )?;
+    }
     ensure!(ca_trusted(root), "本地证书信任未生效，请重新检查系统授权");
     Ok(())
 }
@@ -1167,7 +1329,7 @@ fn assets_digest() -> &'static str {
 fn untrust_ca(root: &Path) -> Result<()> {
     ensure!(
         platform_supported(),
-        "本地证书信任目前仅支持 macOS 和 Windows"
+        "本地证书信任目前仅支持 macOS、Windows 和 Linux"
     );
     let cert = root.join("ca/ca.pem");
     if !cert.is_file() {
@@ -1202,6 +1364,26 @@ fn untrust_ca(root: &Path) -> Result<()> {
         ensure!(
             !ca_trusted(root),
             "本地证书仍在信任列表中，请运行 certmgr.msc，在“受信任的根证书颁发机构”里删除 {}",
+            host().ca_name()
+        );
+    }
+    // Linux：从 NSS 库按别名删除。删不掉必须明确报错——
+    // 残留一条受信 CA，等于给本机留了个长期中间人。
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(db) = nss_db() {
+            let name = host().ca_name();
+            let _ = probe(
+                hidden_command("certutil")
+                    .arg("-d")
+                    .arg(&db)
+                    .args(["-D", "-n", name]),
+                Duration::from_secs(30),
+            );
+        }
+        ensure!(
+            !ca_trusted(root),
+            "本地证书仍在 NSS 证书库中，请运行 certutil -d sql:$HOME/.pki/nssdb -D -n \"{}\"",
             host().ca_name()
         );
     }
@@ -2085,7 +2267,8 @@ fn terminate_pid(pid: u32, root: &Path) {
 
 /// 回收 `ready.json` 已经不记的遗留代理：重启前没回收成功的会一直占着端口和内存。
 /// 只收本目录（root）下的 `proxy.mjs`，排除自己和当前正在跑的 runtime 代理。
-#[cfg(target_os = "macos")]
+/// Linux 上 `pgrep -f` 与 macOS 行为一致，`/usr/bin/pgrep` 由 procps 提供，逻辑可直接复用。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn reap_orphan_proxies(root: &Path) {
     let output = Command::new("/usr/bin/pgrep")
         .args(["-f", "proxy.mjs"])
@@ -2132,7 +2315,7 @@ fn reap_orphan_proxies(root: &Path) {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn reap_orphan_proxies(_root: &Path) {}
 
 /// pid 还活着，且命令行就是本目录的 `proxy.mjs`（与 `ready.json` 里的旧记录核对）。
@@ -2336,6 +2519,31 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
 mod tests {
     use super::*;
 
+    /// `certutil -L` 的真实输出形状：别名左对齐，trust flags 在右侧。
+    ///
+    /// 这条测试锁的是「用 `-L` 而不是 `-L -n`」这个契约——换成 `-L -n` 后
+    /// 输出变成证书详情，别名与 flags 都不在，检测会静默判成未信任。
+    #[test]
+    fn nss_listing_finds_trusted_alias_only() {
+        let listing = concat!(
+            "Certificate Nickname                                         Trust Attributes\n",
+            "                                                             SSL,S/MIME,JAR/XPI\n",
+            "\n",
+            "Claude Local CA                                              C,,\n",
+            "Some Untrusted CA                                            ,,\n",
+            "ClaudeMom Local CA                                           u,u,u\n",
+        );
+        assert!(nss_listing_trusts(listing, "Claude Local CA"), "带 C 的别名是受信 CA");
+        assert!(
+            !nss_listing_trusts(listing, "Some Untrusted CA"),
+            "只有 ,, 的条目不是受信 CA"
+        );
+        assert!(
+            !nss_listing_trusts(listing, "ClaudeMom Local CA"),
+            "u,u,u 是用户证书，不是受信 CA"
+        );
+        assert!(!nss_listing_trusts(listing, "Absent CA"), "库里没有的别名必须为假");
+    }
     #[test]
     fn upstream_web_proxy_prefers_inherited_then_system_and_only_http() {
         let some = |value: &str| Some(value.to_string());
@@ -2486,7 +2694,7 @@ mod tests {
         assert_eq!(friendly_model_name("gpt-image-2-4k"), "GPT Image 2 4k");
     }
 
-    /// mac 形状的单组 sets，与 `profile_sets_for(false, …)` 一致。
+    /// mac 形状的单组 sets，与 `profile_sets_for(ProfilePlatform::Mac, …)` 一致。
     fn mac_sets_at(support: &Path) -> Vec<ProfileSet> {
         vec![ProfileSet {
             data: support.join("Claude"),
@@ -2969,7 +3177,7 @@ server.listen(0,'127.0.0.1',()=>{
     fn profile_sets_cover_mac_and_windows_layouts() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
-        let sets = profile_sets_for(false, &home, None, None);
+        let sets = profile_sets_for(ProfilePlatform::Mac, &home, None, None);
         assert_eq!(sets.len(), 1);
         let support = home.join("Library/Application Support");
         assert_eq!(sets[0].data, support.join("Claude"));
@@ -2986,7 +3194,7 @@ server.listen(0,'127.0.0.1',()=>{
         ] {
             fs::create_dir_all(packages.join(name)).unwrap();
         }
-        let sets = profile_sets_for(true, &home, Some(&roaming), Some(&local));
+        let sets = profile_sets_for(ProfilePlatform::Windows, &home, Some(&roaming), Some(&local));
         assert_eq!(sets.len(), 3, "classic + 两组 packaged，Other 被忽略");
         assert_eq!(sets[0].data, roaming.join("Claude"));
         assert_eq!(sets[0].mode, local.join("Claude"));
@@ -3007,7 +3215,7 @@ server.listen(0,'127.0.0.1',()=>{
     fn desktop_config_paths_preserve_mac_order_and_dedupe() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
-        let sets = profile_sets_for(false, &home, None, None);
+        let sets = profile_sets_for(ProfilePlatform::Mac, &home, None, None);
         let support = home.join("Library/Application Support");
         assert_eq!(
             desktop_config_paths(&sets),
@@ -3021,7 +3229,7 @@ server.listen(0,'127.0.0.1',()=>{
         let roaming = temp.path().join("roaming");
         let local = temp.path().join("local");
         fs::create_dir_all(local.join("Packages").join("Claude_abc")).unwrap();
-        let sets = profile_sets_for(true, &home, Some(&roaming), Some(&local));
+        let sets = profile_sets_for(ProfilePlatform::Windows, &home, Some(&roaming), Some(&local));
         let paths = desktop_config_paths(&sets);
         assert_eq!(paths.len(), sets.len() * 3, "每组 data/mode/three_p 各一份");
         let mut sorted = paths.clone();
@@ -3037,7 +3245,7 @@ server.listen(0,'127.0.0.1',()=>{
         let roaming = temp.path().join("roaming");
         let local = temp.path().join("local");
         fs::create_dir_all(local.join("Packages").join("Claude_abc")).unwrap();
-        let sets = profile_sets_for(true, &home, Some(&roaming), Some(&local));
+        let sets = profile_sets_for(ProfilePlatform::Windows, &home, Some(&roaming), Some(&local));
         assert_eq!(sets.len(), 2, "classic + 一组 packaged");
         let root = temp.path().join("state");
         for set in &sets {
@@ -3160,7 +3368,7 @@ server.listen(0,'127.0.0.1',()=>{
         let roaming = temp.path().join("roaming");
         let local = temp.path().join("local");
         fs::create_dir_all(local.join("Packages").join("Claude_abc")).unwrap();
-        let sets = profile_sets_for(true, &home, Some(&roaming), Some(&local));
+        let sets = profile_sets_for(ProfilePlatform::Windows, &home, Some(&roaming), Some(&local));
         assert_eq!(sets.len(), 2);
         let root = temp.path().join("state");
         fs::create_dir_all(&root).unwrap();
