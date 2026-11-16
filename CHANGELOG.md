@@ -14,10 +14,12 @@
   `ANTHROPIC_*`，Claude Code 于是回落到 `https://api.anthropic.com`，经本地代理就是 SSL 报错。
   启动前把上游写进 Claude Code 的 `<code_dir>/settings.json` 的 `env`（`ANTHROPIC_BASE_URL` 指向本地
   明文端口），它就不再走 TLS，证书问题随之消失。共用 `~/.claude` 时不写，避免改动用户自己的配置。
-- Linux：`api.anthropic.com` 不再本地 MITM。Claude 会剥离 `NODE_EXTRA_CA_CERTS` 这类注入（与拒绝调试参数同一套保护），
-  而 Electron 的 Node 侧不信任本地 CA，内置 Claude Code 打官方域名时就会报
-  「couldn't trace this connection's certificate」。改为对它 TCP 直通：实测直连返回 401、约 3 秒，属快速失败；
-  对话本身走本地 `ANTHROPIC_BASE_URL` 的明文端口，不经过这条路。代价是官方 OAuth 换票与托管设置不再本地 mock。
+- 【已知限制】Linux 上 `api.anthropic.com` 仍由本地代理 MITM，内置 Claude Code 访问它会报
+  「couldn't trace this connection's certificate」。三条 CA 注入路径实测都不成立：Node 不读 NSS
+  （那是 Chromium 用的）、不读系统 store（装入 `/usr/local/share/ca-certificates` 后 Node 仍报
+  `unable to verify the first certificate`）、`NODE_EXTRA_CA_CERTS` 被 Claude 剥离（`ps eww` 验证）。
+  曾试过对该域名 TCP 直通绕开证书，但认证 mock 依赖它，直通后登录态失效（「无法验证您的登录」），
+  两害相权保留 MITM、优先保证登录可用。根治需要让 Node 侧信任本地 CA，属 Electron 层限制。
 - 新增诊断：`cargo run --example probe_linux -p claude-local` 打印解析到的安装路径与版本。
 
 ## 0.1.3 - 2026-11-15

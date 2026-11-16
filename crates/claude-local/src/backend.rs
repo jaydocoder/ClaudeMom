@@ -1893,14 +1893,6 @@ fn start_backend(
         .env("CLAUDE_LOCAL_CACHE_DIR", root.join(".cache"))
         .env("CLAUDE_LOCAL_WEB_I18N_DIR", root.join("catalogs"))
         .env("CLAUDE_LOCAL_UPSTREAM_PROXY", upstream_web_proxy().unwrap_or_default())
-        // Linux：Electron 的 Node 侧不信任本地 CA，而 Claude 又会剥离
-        // NODE_EXTRA_CA_CERTS 这类注入。让代理对 api.anthropic.com 直通，
-        // 内置 Claude Code 就不再撞在 MITM 证书上（实测该域名直连返回 401、
-        // 约 3 秒，属快速失败；对话本身走本地 ANTHROPIC_BASE_URL，不受影响）。
-        .env(
-            "CLAUDE_LOCAL_DIRECT_ANTHROPIC",
-            if cfg!(target_os = "linux") { "1" } else { "0" },
-        )
         .env(
             "CLAUDE_LOCAL_DESKTOP_RESOURCES",
             desktop_resources(&source_app()),
