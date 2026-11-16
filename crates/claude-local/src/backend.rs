@@ -817,6 +817,10 @@ fn probe(command: &mut Command, timeout: Duration) -> Result<(bool, Vec<u8>)> {
     }
 }
 
+/// 跑一条命令并要求成功；stderr 丢弃（macOS / Windows 的这两个工具失败原因都在退出码上）。
+///
+/// Linux 的 certutil 不走这里——它的失败原因只在 stderr 里，见 [`checked_stderr`]。
+#[cfg(any(target_os = "macos", windows))]
 fn checked(command: &mut Command, timeout: Duration, message: &str) -> Result<()> {
     ensure!(probe(command, timeout)?.0, "{message}");
     Ok(())
@@ -1129,7 +1133,7 @@ fn ca_trusted(root: &Path) -> bool {
         };
         let name = host().ca_name();
         return probe(
-            hidden_command("certutil").arg("-d").arg(&db).arg("-L"),
+            hidden_command(nss_tool("certutil")).arg("-d").arg(&db).arg("-L"),
             Duration::from_secs(10),
         )
         .is_ok_and(|(success, bytes)| {
@@ -1164,6 +1168,48 @@ fn nss_listing_trusts(listing: &str, name: &str) -> bool {
 fn nss_db() -> Option<String> {
     let dir = home_dir().join(".pki/nssdb");
     dir.is_dir().then(|| format!("sql:{}", dir.display()))
+}
+
+/// NSS 工具的绝对路径，找不到才回退裸命令名。
+///
+/// GUI（.desktop）启动的进程 PATH 与终端未必一致；`certutil` 在 Ubuntu 上装在
+/// `/usr/bin`，先探绝对路径可以避免被误报成「未安装」。
+#[cfg(target_os = "linux")]
+fn nss_tool(name: &str) -> std::ffi::OsString {
+    for dir in ["/usr/bin", "/bin", "/usr/local/bin"] {
+        let path = Path::new(dir).join(name);
+        if path.is_file() {
+            return path.into_os_string();
+        }
+    }
+    std::ffi::OsString::from(name)
+}
+
+/// 同 [`checked`]，但把子进程 stderr 一并写进错误信息。
+///
+/// certutil 的真实原因（`SEC_ERROR_ADDING_CERT`、库路径不对、依赖缺失）只写在
+/// stderr 里；`probe` 把 stderr 丢掉后，用户只能看到一句猜测性的「请安装
+/// libnss3-tools」，既误导人也没法远程排查。
+///
+/// certutil 的 `-A` / `-D` 是本地毫秒级操作，这里用阻塞 `output()` 即可，
+/// 不必套 `probe` 的超时轮询。
+#[cfg(target_os = "linux")]
+fn checked_stderr(command: &mut Command, message: &str) -> Result<()> {
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| message.to_string())?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    ensure!(
+        output.status.success(),
+        "{}（certutil: {}）",
+        message,
+        if stderr.is_empty() { "无输出" } else { stderr }
+    );
+    Ok(())
 }
 
 fn prepare_ca(root: &Path) -> Result<()> {
@@ -1282,21 +1328,21 @@ fn trust_ca(root: &Path) -> Result<()> {
             bail!("找不到 NSS 证书库 ~/.pki/nssdb，请先启动一次 Claude Desktop 再重试");
         };
         let name = host().ca_name();
+        let certutil = nss_tool("certutil");
         let _ = probe(
-            hidden_command("certutil")
+            hidden_command(&certutil)
                 .arg("-d")
                 .arg(&db)
                 .args(["-D", "-n", name]),
             Duration::from_secs(30),
         );
-        checked(
-            hidden_command("certutil")
+        checked_stderr(
+            hidden_command(&certutil)
                 .arg("-d")
                 .arg(&db)
                 .args(["-A", "-t", "C,,", "-n", name])
                 .arg(root.join("ca/ca.pem")),
-            Duration::from_secs(30),
-            "本地证书未能写入 NSS 证书库，请确认已安装 libnss3-tools（提供 certutil）",
+            "本地证书未能写入 NSS 证书库（需要 libnss3-tools 提供的 certutil）",
         )?;
     }
     ensure!(ca_trusted(root), "本地证书信任未生效，请重新检查系统授权");
@@ -1374,7 +1420,7 @@ fn untrust_ca(root: &Path) -> Result<()> {
         if let Some(db) = nss_db() {
             let name = host().ca_name();
             let _ = probe(
-                hidden_command("certutil")
+                hidden_command(nss_tool("certutil"))
                     .arg("-d")
                     .arg(&db)
                     .args(["-D", "-n", name]),
@@ -2157,6 +2203,23 @@ fn launch_original(
             .env("no_proxy", "localhost,127.0.0.1");
         for (name, value) in &upstream.extra_env {
             command.env(name, value);
+        }
+    }
+    // Linux：Electron 的 Node 侧（内置 Claude Code、主进程的 fetch / 更新检查）走
+    // Node 自己的 CA 链，**不读 NSS 库**。只把 CA 装进 `~/.pki/nssdb` 时，Chromium
+    // 渲染进程一切正常，而 Claude Code 会报 `unable to verify the first certificate`，
+    // 界面上显示成「API Error: SSL certificate verification failed」。
+    //
+    // 实测（Node 经 CONNECT 访问本地代理的 443）：
+    //   不设 → TLS 失败: unable to verify the first certificate
+    //   设置 → TLS 连接成功，authorized=true
+    //
+    // 子进程（Claude Code）继承这个变量，两条 Node 路径都覆盖到。
+    #[cfg(target_os = "linux")]
+    {
+        let ca = root.join("ca/ca.pem");
+        if ca.is_file() {
+            command.env("NODE_EXTRA_CA_CERTS", &ca);
         }
     }
     spawn_detached(&mut command, source, "无法启动原版 Claude Desktop")?;

@@ -4,6 +4,9 @@
 
 - Linux：支持 Anthropic 官方 Claude Desktop 的 deb 安装（`/usr/lib/claude-desktop`，2026-06-30 起官方发布）。安装目录、可执行文件、`resources/`、版本号都按 Linux 布局解析，另带社区重打包版与 `~/.local/lib/claude-desktop` 的探测回退。
 - Linux：本地 CA 必须写进 Electron/Chromium 自己的 NSS 证书库（`~/.pki/nssdb`，经 `certutil`）。系统 openssl store 对它无效——只装系统 CA 的现象是 `curl` 正常、Claude 报 `-202 ERR_CERT_AUTHORITY_INVALID`。本项替代 macOS 的 `security add-trusted-cert`。依赖 `libnss3-tools`。
+- Linux：NSS 只覆盖 Chromium 一侧。Electron 的 **Node 侧**（内置 Claude Code、主进程的 fetch）用 Node 自带的 145 个根证书，既不读 NSS 也不读系统 store，因此仍会报
+  `unable to verify the first certificate`，界面上表现为「API Error: SSL certificate verification failed. Check your proxy or corporate SSL certificates」。
+  启动 Claude 时追加 `NODE_EXTRA_CA_CERTS` 指向本地 CA，交给 Node 侧（子进程 Claude Code 一并继承）。实测：不设时 TLS 握手失败，设置后 `authorized=true`。
 - Linux：真实 profile 目录改用 XDG 的 `~/.config/Claude`（和 `~/.config/Claude-3p`），不再是 `~/Library/Application Support`。
 - Linux：进程识别、停止、遗留代理回收改用 `pgrep` 与 `/bin/kill`。
 - 打包：新增 `deb` 目标；`createUpdaterArtifacts` 关闭（fork 没有自己的签名密钥，开着只会让构建报错）。
