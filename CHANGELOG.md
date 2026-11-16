@@ -14,12 +14,14 @@
   `ANTHROPIC_*`，Claude Code 于是回落到 `https://api.anthropic.com`，经本地代理就是 SSL 报错。
   启动前把上游写进 Claude Code 的 `<code_dir>/settings.json` 的 `env`（`ANTHROPIC_BASE_URL` 指向本地
   明文端口），它就不再走 TLS，证书问题随之消失。共用 `~/.claude` 时不写，避免改动用户自己的配置。
-- 【已知限制】Linux 上 `api.anthropic.com` 仍由本地代理 MITM，内置 Claude Code 访问它会报
-  「couldn't trace this connection's certificate」。三条 CA 注入路径实测都不成立：Node 不读 NSS
-  （那是 Chromium 用的）、不读系统 store（装入 `/usr/local/share/ca-certificates` 后 Node 仍报
-  `unable to verify the first certificate`）、`NODE_EXTRA_CA_CERTS` 被 Claude 剥离（`ps eww` 验证）。
-  曾试过对该域名 TCP 直通绕开证书，但认证 mock 依赖它，直通后登录态失效（「无法验证您的登录」），
-  两害相权保留 MITM、优先保证登录可用。根治需要让 Node 侧信任本地 CA，属 Electron 层限制。
+- Linux 证书要两条信任链分别处理，缺一条就会报错：
+  1) **NSS 库**（`certutil`）—— Chromium 渲染进程用，替代 macOS 的 `security add-trusted-cert`；
+  2) **登录 shell 的 `NODE_EXTRA_CA_CERTS`** —— Electron 的 Node 侧（内置 Claude Code、主进程 fetch）用。
+  Node 既不读 NSS 也不读系统 store（两条都实测过），并且 Claude 会剥离进程继承的同名变量
+  （`ps eww` 验证）；但它启动 Claude Code 时会解析登录 shell 的环境——日志里的
+  `Resolved N login-shell env vars` 在补上该变量后从 28 变成 29，所以写进 `~/.bash_profile` 才生效。
+  缺这条时 Claude Code 报 `SSL certificate verification failed (UNABLE_TO_VERIFY_LEAF_SIGNATURE)`；
+  改用它「TCP 直通绕开证书」会让登录态失效（「无法验证您的登录」），不可取。
 - 新增诊断：`cargo run --example probe_linux -p claude-local` 打印解析到的安装路径与版本。
 
 ## 0.1.3 - 2026-11-15
