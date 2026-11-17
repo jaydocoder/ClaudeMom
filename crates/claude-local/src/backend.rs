@@ -990,14 +990,13 @@ fn claude_processes() -> Result<String> {
         }
         return Ok(listing);
     }
-    // Linux：Electron 的主进程与子进程命令行都以可执行文件路径开头，
-    // 用 `claude-desktop( |$)` 一并匹配；`-fl` 的输出与 macOS 的 pgrep 同形状
-    // （`{pid} {command_line}`），上游的 `claude_pids_on_proxy` 原样可用。
+    // pgrep 的 `-l` 只显示进程名（不含参数），必须用 `-a` 才会输出完整命令行；
+    // `processes_use_proxy` 靠其中的 --proxy-server 端口判断是否由 ClaudeMom 启动。
     // 同一模式也覆盖社区重打包的 `claude-desktop-unofficial`。
     #[cfg(target_os = "linux")]
     {
         let (success, bytes) = probe(
-            Command::new("pgrep").args(["-fl", "claude-desktop( |$)"]),
+            Command::new("pgrep").args(["-af", "claude-desktop( |$)"]),
             PROBE_TIMEOUT,
         )?;
         return Ok(if success {
@@ -3275,6 +3274,17 @@ server.listen(0,'127.0.0.1',()=>{
         assert!(!processes_use_proxy("4509 /Applications/Claude.app/Contents/MacOS/Claude", 53514));
     }
 
+    /// Linux procps 的 `pgrep -af` 输出包含完整命令行，供代理端口识别。
+    #[test]
+    fn linux_pgrep_full_output_detects_managed_proxy() {
+        let listing = concat!(
+            "11238 /usr/lib/claude-desktop/claude-desktop --proxy-server=http://127.0.0.1:41077 --disable-http-cache --lang=zh-CN\n",
+            "11256 /usr/lib/claude-desktop/claude-desktop --type=zygote --no-zygote-sandbox\n",
+        );
+        assert!(processes_use_proxy(listing, 41077));
+        assert!(!processes_use_proxy(listing, 4107));
+        assert_eq!(claude_pids_on_proxy(listing, 41077), vec![11238]);
+    }
     /// pgrep -fl 输出里只取端口精确匹配的 Claude 主进程：helper 行和别的端口行都不算。
     #[test]
     fn claude_pids_on_proxy_picks_only_the_main_process_on_that_port() {
