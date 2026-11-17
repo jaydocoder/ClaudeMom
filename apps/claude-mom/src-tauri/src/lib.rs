@@ -22,6 +22,7 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 pub fn run() {
     host::ClaudeMomHost::install();
     log::append("app.start", serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }));
+    let launch_claude = std::env::args().any(|arg| arg == "--launch-claude");
     let guard_port = std::env::var("CLAUDE_MOM_GUARD_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
@@ -79,7 +80,21 @@ pub fn run() {
             return;
         }
     };
-    app.run(|app_handle, event| match event {
+    let launch_requested = launch_claude;
+    app.run(move |app_handle, event| match event {
+        tauri::RunEvent::Ready if launch_requested => {
+            log::append("app.launch_requested", serde_json::json!({ "source": "desktop-entry" }));
+            let app = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let result = commands::claude_local_action("launch".into()).await;
+                if result.status == "ok" {
+                    log::append("claude_local.auto_launch", serde_json::json!({ "status": "ok" }));
+                } else {
+                    log::append("claude_local.auto_launch_failed", serde_json::json!({ "message": result.message }));
+                    show_main_window(&app);
+                }
+            });
+        }
         tauri::RunEvent::ExitRequested { api, code, .. } => {
             // 窗口全部收起时 Tauri 也会请求退出：没点「退出」就不退。
             if code.is_none() && !EXITING.load(Ordering::SeqCst) {

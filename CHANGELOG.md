@@ -3,26 +3,11 @@
 ## 未发布 · Linux 支持（jaydocoder fork）
 
 - Linux：支持 Anthropic 官方 Claude Desktop 的 deb 安装（`/usr/lib/claude-desktop`，2026-06-30 起官方发布）。安装目录、可执行文件、`resources/`、版本号都按 Linux 布局解析，另带社区重打包版与 `~/.local/lib/claude-desktop` 的探测回退。
-- Linux：本地 CA 必须写进 Electron/Chromium 自己的 NSS 证书库（`~/.pki/nssdb`，经 `certutil`）。系统 openssl store 对它无效——只装系统 CA 的现象是 `curl` 正常、Claude 报 `-202 ERR_CERT_AUTHORITY_INVALID`。本项替代 macOS 的 `security add-trusted-cert`。依赖 `libnss3-tools`。
-- Linux：NSS 只覆盖 Chromium 一侧。Electron 的 **Node 侧**（内置 Claude Code、主进程的 fetch）用 Node 自带的 145 个根证书，既不读 NSS 也不读系统 store，因此仍会报
-  `unable to verify the first certificate`，界面上表现为「API Error: SSL certificate verification failed. Check your proxy or corporate SSL certificates」。
-  启动 Claude 时追加 `NODE_EXTRA_CA_CERTS` 指向本地 CA，交给 Node 侧（子进程 Claude Code 一并继承）。实测：不设时 TLS 握手失败，设置后 `authorized=true`。
-- Linux：真实 profile 目录改用 XDG 的 `~/.config/Claude`（和 `~/.config/Claude-3p`），不再是 `~/Library/Application Support`。
-- Linux：进程识别、停止、遗留代理回收改用 `pgrep` 与 `/bin/kill`。
-- 打包：新增 `deb` 目标；`createUpdaterArtifacts` 关闭（fork 没有自己的签名密钥，开着只会让构建报错）。
-- Linux：真正让内置 Claude Code 可用的是**配置文件**而不是环境变量。Claude 有网络覆盖保护，会剥离继承来的
-  `ANTHROPIC_*`，Claude Code 于是回落到 `https://api.anthropic.com`，经本地代理就是 SSL 报错。
-  启动前把上游写进 Claude Code 的 `<code_dir>/settings.json` 的 `env`（`ANTHROPIC_BASE_URL` 指向本地
-  明文端口），它就不再走 TLS，证书问题随之消失。共用 `~/.claude` 时不写，避免改动用户自己的配置。
-- Linux 证书要两条信任链分别处理，缺一条就会报错：
-  1) **NSS 库**（`certutil`）—— Chromium 渲染进程用，替代 macOS 的 `security add-trusted-cert`；
-  2) **登录 shell 的 `NODE_EXTRA_CA_CERTS`** —— Electron 的 Node 侧（内置 Claude Code、主进程 fetch）用。
-  Node 既不读 NSS 也不读系统 store（两条都实测过），并且 Claude 会剥离进程继承的同名变量
-  （`ps eww` 验证）；但它启动 Claude Code 时会解析登录 shell 的环境——日志里的
-  `Resolved N login-shell env vars` 在补上该变量后从 28 变成 29，所以写进 `~/.bash_profile` 才生效。
-  缺这条时 Claude Code 报 `SSL certificate verification failed (UNABLE_TO_VERIFY_LEAF_SIGNATURE)`；
-  改用它「TCP 直通绕开证书」会让登录态失效（「无法验证您的登录」），不可取。
-- 新增诊断：`cargo run --example probe_linux -p claude-local` 打印解析到的安装路径与版本。
+- Linux：Claude 桌面图标可转交 ClaudeMom 启动（`--launch-claude`），走当前选中的上游配置；用用户级 `.desktop` 覆盖，不改系统包文件，删除覆盖项即可恢复。
+- Linux：本地 CA 需分别加入 Chromium 的 NSS 库（`~/.pki/nssdb`，`libnss3-tools`）和 Claude Code 所读的登录 shell 环境（`NODE_EXTRA_CA_CERTS` 写在 `~/.bash_profile`）。Node 不读 NSS 或系统 CA store；Claude 会剥离继承的同名变量，但启动 Claude Code 时会解析登录 shell 的环境。
+- Linux：真实 profile 目录使用 XDG 的 `~/.config/Claude` / `~/.config/Claude-3p`；进程识别、停止和遗留代理回收使用 `pgrep -af` 与 `/bin/kill`。
+- 打包：新增 `deb` 目标；fork 关闭 `createUpdaterArtifacts`。
+- 新增诊断：`cargo run --example probe_linux -p claude-local`。
 
 ## 0.1.3 - 2026-11-15
 
