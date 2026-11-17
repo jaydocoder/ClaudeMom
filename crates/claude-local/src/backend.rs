@@ -625,17 +625,42 @@ fn recover_orphan_config_library(sets: &[ProfileSet], root: &Path) -> Result<Opt
     Ok((!notes.is_empty()).then(|| notes.join("\n")))
 }
 
+/// 各 profile 的 `claude_desktop_config.json` 是否都已经是 1p。
+///
+/// 文件缺失按「无需切换」处理（切换只给存在的配置写 deploymentMode）。
+/// 解析失败按「不是 1p」处理：宁可重新切换一次，也不要停在坏状态。
+fn desktop_configs_are_one_p(sets: &[ProfileSet]) -> bool {
+    desktop_config_paths(sets).iter().all(|path| match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("deploymentMode")
+                    .and_then(Value::as_str)
+                    .map(|mode| mode == "1p")
+            })
+            .unwrap_or(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    })
+}
+
 fn apply_real_profile_one_p(sets: &[ProfileSet], root: &Path) -> Result<()> {
     recover_orphan_config_library(sets, root)?;
     let state_path = switch_state_path(root);
     if state_path.exists() {
-        // 已按记录切换过：校验仍在 1p 状态即可（幂等）。
         let state: Value = serde_json::from_slice(&fs::read(&state_path)?)?;
         ensure!(
             state["applied"].as_bool() == Some(true),
             "Claude 本地模式切换状态文件不一致，请检查 {SWITCH_STATE_FILE}"
         );
-        return Ok(());
+        // 状态文件说「已切换」，但现场可能已被 restore 还原（或 restore 中途失败）。
+        // 只信状态文件会永久卡在 3p：Claude 不进本地模拟登录态、界面一直要求登录。
+        // 所以校验实际配置，不一致就丢掉陈旧状态、按下面流程重新切换。
+        if desktop_configs_are_one_p(sets) {
+            return Ok(());
+        }
+        let _ = fs::remove_file(&state_path);
     }
     private_dir(root)?;
     let mut original = serde_json::Map::new();

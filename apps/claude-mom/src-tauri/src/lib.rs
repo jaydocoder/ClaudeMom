@@ -5,6 +5,9 @@ mod host;
 mod log;
 mod upstreams;
 
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::menu::{Menu, MenuItem};
@@ -18,6 +21,10 @@ const TRAY_QUIT: &str = "tray_quit";
 const GUARD_PORT: u16 = 57519;
 
 static EXITING: AtomicBool = AtomicBool::new(false);
+/// 常驻实例的 AppHandle：唤醒线程拿到它才能触发启动。
+static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+/// 第二次从桌面图标启动时，由新进程发给常驻实例的请求。
+const WAKE_LAUNCH: &str = "launch-claude";
 
 pub fn run() {
     host::ClaudeMomHost::install();
@@ -27,11 +34,38 @@ pub fn run() {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(GUARD_PORT);
-    // 已经有一个在跑：交给系统把它带到前台（macOS 上 open 同一个 app 即可），自己退出。
-    let Ok(_guard) = std::net::TcpListener::bind(("127.0.0.1", guard_port)) else {
-        log::append("app.already_running", serde_json::json!({ "port": guard_port }));
-        return;
+    // 已经有一个常驻实例：把「从桌面图标启动」的请求转给它，再自己退出。
+    // 不转达的话，托盘常驻时点 Claude 图标会毫无反应（用户看到的就是「没生效」）。
+    let listener = match TcpListener::bind(("127.0.0.1", guard_port)) {
+        Ok(listener) => listener,
+        Err(_) => {
+            if launch_claude
+                && let Ok(mut stream) = TcpStream::connect(("127.0.0.1", guard_port))
+            {
+                let _ = stream.write_all(WAKE_LAUNCH.as_bytes());
+                let _ = stream.flush();
+            }
+            log::append("app.already_running", serde_json::json!({ "port": guard_port }));
+            return;
+        }
     };
+    // 常驻实例：接收后来者的唤醒请求（第二次点桌面图标走这里）。
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut buffer = [0u8; 64];
+                let Ok(read) = stream.read(&mut buffer) else {
+                    return;
+                };
+                if String::from_utf8_lossy(&buffer[..read]).contains(WAKE_LAUNCH)
+                    && let Some(app) = APP.get()
+                {
+                    launch_claude_now(app.clone());
+                }
+            });
+        }
+    });
     // 程序重启后，Claude 可能还挂在旧代理端口上：在原端口把本地服务拉起来，它的重试就能连上。
     std::thread::spawn(|| match claude_local::resume_attached_proxy() {
         Ok(Some(port)) => log::append("claude_local.resumed", serde_json::json!({ "port": port })),
@@ -44,6 +78,8 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             install_tray(app)?;
+            // 唤醒线程要用：注册当前实例，后来者才能触发启动。
+            let _ = APP.set(app.handle().clone());
             if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
                 let hide_target = window.clone();
                 window.on_window_event(move |event| {
@@ -84,16 +120,7 @@ pub fn run() {
     app.run(move |app_handle, event| match event {
         tauri::RunEvent::Ready if launch_requested => {
             log::append("app.launch_requested", serde_json::json!({ "source": "desktop-entry" }));
-            let app = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let result = commands::claude_local_action("launch".into()).await;
-                if result.status == "ok" {
-                    log::append("claude_local.auto_launch", serde_json::json!({ "status": "ok" }));
-                } else {
-                    log::append("claude_local.auto_launch_failed", serde_json::json!({ "message": result.message }));
-                    show_main_window(&app);
-                }
-            });
+            launch_claude_now(app_handle.clone());
         }
         tauri::RunEvent::ExitRequested { api, code, .. } => {
             // 窗口全部收起时 Tauri 也会请求退出：没点「退出」就不退。
@@ -110,6 +137,22 @@ pub fn run() {
         tauri::RunEvent::Reopen { .. } => show_main_window(app_handle),
         _ => {
             let _ = app_handle;
+        }
+    });
+}
+
+/// 在当前实例里执行「启动 Claude」：桌面图标入口与后来者的唤醒请求共用。
+fn launch_claude_now(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let result = commands::claude_local_action("launch".into()).await;
+        if result.status == "ok" {
+            log::append("claude_local.auto_launch", serde_json::json!({ "status": "ok" }));
+        } else {
+            log::append(
+                "claude_local.auto_launch_failed",
+                serde_json::json!({ "message": result.message }),
+            );
+            show_main_window(&app);
         }
     });
 }

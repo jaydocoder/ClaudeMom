@@ -3,7 +3,8 @@
 ## 未发布 · Linux 支持（jaydocoder fork）
 
 - Linux：支持 Anthropic 官方 Claude Desktop 的 deb 安装（`/usr/lib/claude-desktop`，2026-06-30 起官方发布）。安装目录、可执行文件、`resources/`、版本号都按 Linux 布局解析，另带社区重打包版与 `~/.local/lib/claude-desktop` 的探测回退。
-- Linux：Claude 桌面图标可转交 ClaudeMom 启动（`--launch-claude`），走当前选中的上游配置；用用户级 `.desktop` 覆盖，不改系统包文件，删除覆盖项即可恢复。
+- Linux：Claude 桌面图标可转交 ClaudeMom 启动（`--launch-claude`），走当前选中的上游配置；用用户级 `.desktop` 覆盖，不改系统包文件，删除覆盖项即可恢复。ClaudeMom 已在托盘常驻时，新进程会通过单实例锁端口把启动请求转给常驻实例，不再静默退出。
+- Linux：修复「本地模拟登录态不生效」。真实 profile 的 1p 切换原来只看状态文件 `real-profile-switch.json` 就返回，一旦该文件与实际配置不一致（例如停止后还原到 3p、但状态文件未清），就会永久卡在 3p，Claude 界面一直要求登录。现在会校验 `deploymentMode` 实际值，不一致就丢掉陈旧状态重新切换。
 - Linux：本地 CA 需分别加入 Chromium 的 NSS 库（`~/.pki/nssdb`，`libnss3-tools`）和 Claude Code 所读的登录 shell 环境（`NODE_EXTRA_CA_CERTS` 写在 `~/.bash_profile`）。Node 不读 NSS 或系统 CA store；Claude 会剥离继承的同名变量，但启动 Claude Code 时会解析登录 shell 的环境。
 - Linux：真实 profile 目录使用 XDG 的 `~/.config/Claude` / `~/.config/Claude-3p`；进程识别、停止和遗留代理回收使用 `pgrep -af` 与 `/bin/kill`。
 - 打包：新增 `deb` 目标；fork 关闭 `createUpdaterArtifacts`。
